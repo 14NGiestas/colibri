@@ -15,6 +15,17 @@ SPEC.loader.exec_module(ORACLE)
 
 
 class DSparkIdentityTests(unittest.TestCase):
+    def test_make_target_uses_supported_validation_flags(self):
+        makefile = (Path(__file__).resolve().parents[1] / "Makefile").read_text(
+            encoding="utf-8"
+        )
+        target = makefile.split("deepseek-v4-oracle: deepseek-v4", 1)[1]
+        target = target.split("\nelse\n", 1)[0]
+        self.assertIn("--validate", target)
+        self.assertIn("--teacher-forcing", target)
+        self.assertIn("--check-dspark", target)
+        self.assertNotIn("--continuation", target)
+
     def run_validation(self, generated: list[list[int]]) -> int:
         with tempfile.TemporaryDirectory() as directory:
             oracle_path = Path(directory) / "oracle.json"

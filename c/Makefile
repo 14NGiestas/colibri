@@ -296,7 +296,8 @@ deepseek-v4-oracle: deepseek-v4
 		--output tests/deepseek_v4_oracle.json \
 		--memory-gb $(or $(MEMORY_GB),32) \
 		--prompt "$(or $(ORACLE_PROMPT),The capital of France is)" \
-		--continuation "$(or $(ORACLE_CONTINUATION), Paris.)" \
+		--validate \
+		--teacher-forcing $(or $(ORACLE_TEACHER_FORCING),32) \
 		--greedy $(or $(ORACLE_GREEDY),20) \
 		--check-dspark
 else
