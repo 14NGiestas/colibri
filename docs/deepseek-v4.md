@@ -1,5 +1,7 @@
 # DeepSeek V4 (colibri CPU)
 
+English · [简体中文](deepseek-v4.zh-CN.md)
+
 Local CPU inference for DeepSeek V4 Flash + DSpark on colibri: weight loading,
 expert caching, sparse attention, speculative decode, and automatic RAM
 tiering—end-to-end generation that passes smoke tests.
