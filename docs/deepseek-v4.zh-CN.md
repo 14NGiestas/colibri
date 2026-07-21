@@ -262,4 +262,6 @@ Chat 每轮都会重新 prefill 历史记录；尚未实现跨轮 KV 复用。
 - [ ] **模型量化**：采用更激进的权重／激活路径，降低占用和带宽需求
 - [ ] **服务器**：面向多客户端的 HTTP／OpenAI 兼容 API
 - [ ] **CUDA**：在 CPU 路径之外增加可选 GPU 后端
+- [ ] **长输出动态 DSpark 调节**：根据近期 prefix survival／confidence，
+      在 K=2–4 之间动态选择验证窗口，不再始终使用固定 K
 - [ ] Chat 跨轮 KV cache 复用，避免每轮重新 prefill 全部历史

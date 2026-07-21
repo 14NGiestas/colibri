@@ -269,4 +269,6 @@ Default non-thinking encoding:
 - [ ] **Model quantization**: more aggressive weight/activation paths for footprint and bandwidth
 - [ ] **Server**: HTTP / OpenAI-compatible API for multi-client use
 - [ ] **CUDA**: optional GPU backend alongside the CPU path
+- [ ] **Dynamic DSpark for long outputs**: adapt the verify window between K=2–4
+      from recent prefix survival / confidence instead of keeping a fixed K
 - [ ] Chat cross-turn KV cache reuse (avoid full re-prefill every turn)
