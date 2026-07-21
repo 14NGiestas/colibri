@@ -10,6 +10,9 @@
 /* ---- begin include deepseek_v4_config.c ---- */
 #include "deepseek_v4_internal.h"
 
+#include <float.h>
+#include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,20 +30,28 @@ static int set_error(char *error, size_t size, const char *format, ...) {
     return -1;
 }
 
+static int json_int_value(const jval *value, int *output) {
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        floor(value->num) != value->num ||
+        value->num < (double)INT_MIN || value->num > (double)INT_MAX)
+        return -1;
+    *output = (int)value->num;
+    return 0;
+}
+
 static int required_int(jval *root, const char *name, int *output,
                         char *error, size_t error_size) {
-    jval *value = json_get(root, name);
-    if (!value || value->t != J_NUM)
-        return set_error(error, error_size, "missing integer config field: %s", name);
-    *output = (int)value->num;
+    if (json_int_value(json_get(root, name), output) != 0)
+        return set_error(error, error_size, "invalid integer config field: %s", name);
     return 0;
 }
 
 static int required_float(jval *root, const char *name, float *output,
                           char *error, size_t error_size) {
     jval *value = json_get(root, name);
-    if (!value || value->t != J_NUM)
-        return set_error(error, error_size, "missing numeric config field: %s", name);
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        fabs(value->num) > (double)FLT_MAX)
+        return set_error(error, error_size, "invalid numeric config field: %s", name);
     *output = (float)value->num;
     return 0;
 }
@@ -62,6 +73,7 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
     char *arena = NULL;
     jval *root = json_parse(json, &arena);
     if (!root || root->t != J_OBJ) {
+        json_free(root);
         free(arena);
         return set_error(error, error_size, "DeepSeek-V4 config is not an object");
     }
@@ -99,6 +111,7 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         required_float(root, "rope_theta", &config->rope_theta, error, error_size) ||
         required_float(root, "compress_rope_theta", &config->compress_rope_theta, error, error_size);
     if (failed) {
+        json_free(root);
         free(arena);
         return -1;
     }
@@ -109,27 +122,31 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         required_int(rope, "beta_fast", &config->rope_beta_fast, error, error_size) ||
         required_int(rope, "beta_slow", &config->rope_beta_slow, error, error_size) ||
         required_float(rope, "factor", &config->rope_factor, error, error_size)) {
+        json_free(root);
         free(arena);
         return -1;
     }
     jval *ratios = json_get(root, "compress_ratios");
     if (!ratios || ratios->t != J_ARR || ratios->len < 1 ||
         ratios->len > COLI_V4_MAX_LAYERS) {
+        json_free(root);
         free(arena);
         return set_error(error, error_size, "invalid compress_ratios");
     }
     config->compress_ratio_count = ratios->len;
     for (int index = 0; index < ratios->len; index++) {
-        if (ratios->kids[index]->t != J_NUM) {
+        if (json_int_value(ratios->kids[index],
+                           &config->compress_ratios[index]) != 0) {
+            json_free(root);
             free(arena);
-            return set_error(error, error_size, "non-numeric compress ratio");
+            return set_error(error, error_size, "invalid compress ratio");
         }
-        config->compress_ratios[index] = (int)ratios->kids[index]->num;
     }
     jval *quantization = json_get(root, "quantization_config");
     if (!quantization || quantization->t != J_OBJ ||
         require_string(quantization, "fmt", "e4m3", error, error_size) ||
         require_string(quantization, "scale_fmt", "ue8m0", error, error_size)) {
+        json_free(root);
         free(arena);
         return -1;
     }
@@ -140,9 +157,11 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         config->n_shared_experts != 1 || config->hc_mult < 1 ||
         config->compress_ratio_count != config->num_hidden_layers +
                                         config->num_nextn_predict_layers) {
+        json_free(root);
         free(arena);
         return set_error(error, error_size, "inconsistent DeepSeek-V4 config dimensions");
     }
+    json_free(root);
     free(arena);
     return 0;
 }
@@ -190,20 +209,30 @@ int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
 
 int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
                          char *error, size_t error_size) {
-    int result = coli_v4_config_parse_strict(config, json, error, error_size);
-    if (!result) return 0;
-    if (!config || !json || !strstr(json, "\"dspark_block_size\"") ||
+    char strict_error[256] = {0};
+    int result = coli_v4_config_parse_strict(
+        config, json, strict_error, sizeof(strict_error));
+    if (!result) {
+        if (error && error_size) error[0] = 0;
+        return 0;
+    }
+    if (strcmp(strict_error, "inconsistent DeepSeek-V4 config dimensions") ||
+        !config || !json || !strstr(json, "\"dspark_block_size\"") ||
         config->num_hidden_layers < 1 ||
         config->compress_ratio_count <= config->num_hidden_layers)
-        return result;
+        return set_error(error, error_size, "%s", strict_error);
     int inferred = config->compress_ratio_count - config->num_hidden_layers;
     if (inferred < 1 || inferred > COLI_V4_DSPARK_MAX_STAGES)
-        return result;
+        return set_error(error, error_size, "%s", strict_error);
     config->num_nextn_predict_layers = inferred;
-    if (config->num_experts_per_tok < 1 ||
+    if (config->hidden_size < 1 || config->num_hidden_layers < 1 ||
+        config->num_attention_heads < 1 || config->n_routed_experts < 1 ||
+        config->num_experts_per_tok < 1 ||
         config->num_experts_per_tok > config->n_routed_experts ||
-        config->n_shared_experts != 1 || config->hc_mult < 1)
-        return result;
+        config->n_shared_experts != 1 || config->hc_mult < 1 ||
+        config->compress_ratio_count != config->num_hidden_layers +
+                                        config->num_nextn_predict_layers)
+        return set_error(error, error_size, "%s", strict_error);
     if (error && error_size) error[0] = 0;
     return 0;
 }

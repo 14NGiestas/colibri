@@ -75,10 +75,12 @@ $(SHARED_OBJS): %.o: %.c
 native_quant_parallel.o native_quant_dual.o native_quant_batch_avx512.o: \
 	native_quant.c native_quant.h
 
-$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h deepseek_v4_dspark.h
+$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
+	deepseek_v4_dspark.h deepseek_v4_internal.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
-$(DSPARK_OBJS): %.o: deepseek_v4_dspark.c deepseek_v4.h deepseek_v4_dspark.h
+$(DSPARK_OBJS): %.o: deepseek_v4_dspark.c deepseek_v4.h \
+	deepseek_v4_dspark.h deepseek_v4_internal.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4_dspark.c -o $@
 
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)

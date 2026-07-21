@@ -218,7 +218,8 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
+	tests/test_v4_config_dspark_compat$(EXE)
 endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
@@ -532,6 +533,16 @@ $(V4_OWN_DIR)/safetensors_index.o: safetensors_index.c safetensors_index.h | $(V
 
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
+
+COLI_V4_UNIT_CONFIG_DSPARK_COMPAT.o: deepseek_v4_dspark.c deepseek_v4.h \
+		deepseek_v4_dspark.h deepseek_v4_internal.h Makefile.deepseek-v4
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
+
+tests/test_v4_config_dspark_compat$(EXE): \
+		tests/test_v4_config_dspark_compat.c \
+		COLI_V4_UNIT_CONFIG_DSPARK_COMPAT.o
+	$(CC) $(CFLAGS) $< COLI_V4_UNIT_CONFIG_DSPARK_COMPAT.o \
+		-o $@ $(LDFLAGS)
 endif
 
 tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
