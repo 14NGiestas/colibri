@@ -83,6 +83,7 @@ typedef struct {
     int verify_drafts;              /* 0 => runner default */
     int pin_slots_per_layer;        /* -1 => auto */
     uint64_t repin_interval;        /* 0 => auto */
+    int no_dspark;                  /* skip all DSpark loading and capture */
 } ColiV4EngineOpenOptions;
 
 typedef struct {

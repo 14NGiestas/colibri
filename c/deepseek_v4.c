@@ -707,13 +707,15 @@ int coli_v4_expert_store_open_planned(
         plan.expert_cache_bytes + (resident_head ? head_bytes : 0);
     if (resident_head && coli_v4_head_cache_load(
             engine, options->model_dir, error, error_size)) return -1;
+    const char *dspark_tier = (dspark_model && *dspark_model)
+        ? (full_resident ? "resident" : "streamed") : "disabled";
     fprintf(stderr,
         "ram_tiers available=%.2fGiB dense=%s(%.2fGiB) "
         "dspark=%s(%.2fGiB) dspark_experts=%.2fGiB "
         "target_slots=%d target_cache=%.2fGiB head=%s projected=%.2fGiB\n",
         plan.planner_available_bytes / (double)GIB,
         full_resident ? "resident" : "streamed", dense_bytes / (double)GIB,
-        full_resident ? "resident" : "streamed", dspark_bytes / (double)GIB,
+        dspark_tier, dspark_bytes / (double)GIB,
         dspark_full_experts / (double)GIB, slots,
         plan.expert_cache_bytes / (double)GIB,
         resident_head ? "resident-bf16" : "streamed-bf16",
@@ -5771,10 +5773,13 @@ int coli_v4_engine_open(ColiV4Engine **output,
     }
 
     engine->owned_target_model_dir = strdup(options->target_model_dir);
-    engine->owned_dspark_model_dir = strdup(
-        options->dspark_model_dir ? options->dspark_model_dir
-                                  : options->target_model_dir);
-    if (!engine->owned_target_model_dir || !engine->owned_dspark_model_dir) {
+    const char *dspark_model_dir = options->no_dspark ? NULL :
+        (options->dspark_model_dir ? options->dspark_model_dir
+                                   : options->target_model_dir);
+    engine->owned_dspark_model_dir = dspark_model_dir
+        ? strdup(dspark_model_dir) : NULL;
+    if (!engine->owned_target_model_dir ||
+        (dspark_model_dir && !engine->owned_dspark_model_dir)) {
         if (error && error_size)
             snprintf(error, error_size, "out of memory copying model directories");
         goto fail;
@@ -7026,7 +7031,8 @@ int coli_v4_session_generate(ColiV4Session *session,
         return -1;
     session->state = state;
     session->next = next;
-    if (coli_v4_dspark_capture_main_x(engine, main_x_batch, prompt_count, config)) {
+    if (!options->no_dspark &&
+        coli_v4_dspark_capture_main_x(engine, main_x_batch, prompt_count, config)) {
         if (error && error_size)
             snprintf(error, error_size, "dspark capture main_x failed");
         return -1;
@@ -7080,7 +7086,8 @@ int coli_v4_session_generate(ColiV4Session *session,
             if (final_hidden(hidden, state, index, config, error, error_size) ||
                 head_argmax(engine, hidden, index, config, &current, &current_logit))
                 return -1;
-            if (coli_v4_dspark_capture_main_x(engine, main_x_batch, 1, config)) {
+            if (!options->no_dspark &&
+                coli_v4_dspark_capture_main_x(engine, main_x_batch, 1, config)) {
                 if (error && error_size)
                     snprintf(error, error_size, "dspark capture failed");
                 return -1;
@@ -7364,6 +7371,7 @@ int main(int argc, char **argv) {
         ColiV4EngineOpenOptions open_opts = {
             .target_model_dir = cli.model_dir,
             .dspark_model_dir = cli.draft_model_dir,
+            .no_dspark = cli.no_dspark,
             .pin_slots_per_layer = -1,
         };
         if (cli.memory_gib > 0.0)

@@ -2968,6 +2968,7 @@ void coli_v4_dspark_capture_after_block(
     ColiV4Engine *engine, const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, const float *outputs, int batch) {
     if (!engine || !weights || !config || !outputs || batch < 1) return;
+    if (!engine->runtime.dspark_model_dir) return;
     if (capture_init(engine, config)) return;
     int ordinal = target_ordinal(engine, weights->plan.layer);
     if (ordinal < 0) return;
