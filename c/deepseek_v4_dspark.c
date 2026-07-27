@@ -1407,7 +1407,7 @@ int coli_v4_dspark_attention_block(
     }
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * d;
-    int scale_columns = (hidden + 127) / 128;
+    int scale_columns = (group_width + 127) / 128;
     int scale_rows = (orank + 127) / 128;
     float *group_inputs = malloc((size_t)batch * group_width * sizeof(float));
     float *group_outputs = malloc((size_t)batch * orank * sizeof(float));

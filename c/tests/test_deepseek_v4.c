@@ -168,9 +168,18 @@ static int test_config(int argc, char **argv) {
             fprintf(stderr, "%s\n", error);
             return 1;
         }
-        if (config.hidden_size != 4096 || config.num_hidden_layers != 43 ||
-            config.n_routed_experts != 256 || config.num_experts_per_tok != 6 ||
-            config.compress_ratio_count != 44 || config.compress_ratios[2] != 4 ||
+        int flash = config.hidden_size == 4096 &&
+            config.num_hidden_layers == 43 &&
+            config.n_routed_experts == 256 &&
+            config.compress_ratio_count == 44 &&
+            config.compress_ratios[0] == 0;
+        int pro = config.hidden_size == 7168 &&
+            config.num_hidden_layers == 61 &&
+            config.n_routed_experts == 384 &&
+            config.compress_ratio_count == 62 &&
+            config.compress_ratios[0] == 128;
+        if ((!flash && !pro) || config.num_experts_per_tok != 6 ||
+            config.compress_ratios[2] != 4 ||
             config.compress_ratios[3] != 128 || config.hc_mult != 4)
             return 1;
     }
@@ -446,6 +455,20 @@ static int test_layer(void) {
     assert(ape && ape->shape[0] == 128 && ape->shape[1] == 512);
     assert(find_spec(&plan, "ffn.gate.bias") != NULL);
 
+    /* V4 Pro no longer has hidden_size == one output-attention group's
+       input width.  Keep the grouped wo_a layout derived from heads/groups. */
+    config.hidden_size = 7168;
+    config.num_attention_heads = 128;
+    config.o_groups = 16;
+    assert(coli_v4_layer_plan(&plan, &config, 0, error, sizeof(error)) == 0);
+    const ColiDeepSeekV4TensorSpec *wo_a =
+        find_spec(&plan, "attn.wo_a.weight");
+    const ColiDeepSeekV4TensorSpec *wo_a_scale =
+        find_spec(&plan, "attn.wo_a.scale");
+    assert(wo_a && wo_a->shape[0] == 16384 && wo_a->shape[1] == 4096);
+    assert(wo_a_scale && wo_a_scale->shape[0] == 128 &&
+           wo_a_scale->shape[1] == 32);
+
     puts("deepseek_v4_layer tests passed");
     return 0;
 }
@@ -643,6 +666,49 @@ static int test_resource_plan(void) {
         return 1;
     input = fixture(4 * GIB);
     if (coli_v4_resource_plan_compute(&capped, &input, error, sizeof(error)) == 0)
+        return 1;
+
+    ColiDeepSeekV4ResidentTierPlan tiers;
+    ColiDeepSeekV4ResidentTierInputs target_only = {
+        40 * GIB, 4 * GIB, 24 * GIB, 0, 0, 12 * GIB, 0,
+    };
+    if (coli_v4_resident_tier_plan(
+            &tiers, &target_only, error, sizeof(error)) ||
+        !tiers.dense_resident || tiers.dspark_resident ||
+        tiers.dense_bytes != 24 * GIB || tiers.dspark_bytes)
+        return 1;
+    target_only.available_bytes = 39 * GIB;
+    if (coli_v4_resident_tier_plan(
+            &tiers, &target_only, error, sizeof(error)) ||
+        tiers.dense_resident || tiers.dspark_resident || tiers.dense_bytes ||
+        tiers.dspark_bytes)
+        return 1;
+
+    ColiDeepSeekV4ResidentTierInputs with_dspark = {
+        60 * GIB, 4 * GIB, 24 * GIB, 2 * GIB, 20 * GIB, 12 * GIB, 1,
+    };
+    if (coli_v4_resident_tier_plan(
+            &tiers, &with_dspark, error, sizeof(error)) ||
+        !tiers.dense_resident || !tiers.dspark_resident ||
+        tiers.dense_bytes != 24 * GIB || tiers.dspark_bytes != 20 * GIB)
+        return 1;
+    with_dspark.available_bytes = 48 * GIB;
+    if (coli_v4_resident_tier_plan(
+            &tiers, &with_dspark, error, sizeof(error)) ||
+        !tiers.dense_resident || tiers.dspark_resident ||
+        tiers.dense_bytes != 24 * GIB || tiers.dspark_bytes != 2 * GIB)
+        return 1;
+    with_dspark.available_bytes = 40 * GIB;
+    if (coli_v4_resident_tier_plan(
+            &tiers, &with_dspark, error, sizeof(error)) ||
+        tiers.dense_resident || !tiers.dspark_resident || tiers.dense_bytes ||
+        tiers.dspark_bytes != 20 * GIB)
+        return 1;
+    with_dspark.available_bytes = 32 * GIB;
+    if (coli_v4_resident_tier_plan(
+            &tiers, &with_dspark, error, sizeof(error)) ||
+        tiers.dense_resident || tiers.dspark_resident || tiers.dense_bytes ||
+        tiers.dspark_bytes != 2 * GIB)
         return 1;
     puts("DeepSeek V4 resource plan tests: ok");
     return 0;

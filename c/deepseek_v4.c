@@ -81,6 +81,10 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     const int64_t heads = config->num_attention_heads;
     const int64_t head_dim = config->head_dim;
     const int64_t q_rank = config->q_lora_rank;
+    if (config->o_groups < 1 || heads % config->o_groups != 0)
+        return set_error(error, error_size, "unsupported grouped-output attention dimensions");
+    const int64_t o_group_width =
+        (heads / config->o_groups) * head_dim;
     const int64_t o_width = (int64_t)config->o_groups * config->o_lora_rank;
     const int64_t experts = config->n_routed_experts;
     const int64_t moe = config->moe_intermediate_size;
@@ -91,7 +95,7 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     ADD(add_1d(plan, COLI_ST_BF16, head_dim, "attn.kv_norm.weight", error, error_size));
     ADD(add_1d(plan, COLI_ST_BF16, q_rank, "attn.q_norm.weight", error, error_size));
     ADD(add_fp8(plan, head_dim, hidden, "attn.wkv", error, error_size));
-    ADD(add_fp8(plan, o_width, hidden, "attn.wo_a", error, error_size));
+    ADD(add_fp8(plan, o_width, o_group_width, "attn.wo_a", error, error_size));
     ADD(add_fp8(plan, hidden, o_width, "attn.wo_b", error, error_size));
     ADD(add_fp8(plan, q_rank, hidden, "attn.wq_a", error, error_size));
     ADD(add_fp8(plan, heads * head_dim, q_rank, "attn.wq_b", error, error_size));
@@ -414,6 +418,65 @@ int coli_v4_resource_plan_compute(
         return plan_error(error, error_size, "V4 plan exceeds available RAM");
     return 0;
 }
+
+static int resident_tiers_fit(uint64_t available, uint64_t fixed,
+                              uint64_t dense, uint64_t dspark,
+                              uint64_t minimum_experts) {
+    uint64_t total;
+    return !add_u64(fixed, dense, &total) &&
+           !add_u64(total, dspark, &total) &&
+           !add_u64(total, minimum_experts, &total) && total <= available;
+}
+
+int coli_v4_resident_tier_plan(
+    ColiDeepSeekV4ResidentTierPlan *plan,
+    const ColiDeepSeekV4ResidentTierInputs *inputs,
+    char *error, size_t error_size) {
+    if (!plan || !inputs || !inputs->available_bytes ||
+        !inputs->dense_bytes || !inputs->minimum_expert_bytes ||
+        (inputs->has_dspark &&
+         (!inputs->dspark_streamed_bytes || !inputs->dspark_full_bytes ||
+          inputs->dspark_full_bytes < inputs->dspark_streamed_bytes)) ||
+        (!inputs->has_dspark &&
+         (inputs->dspark_streamed_bytes || inputs->dspark_full_bytes)))
+        return plan_error(error, error_size,
+                          "invalid V4 resident-tier inputs");
+    memset(plan, 0, sizeof(*plan));
+
+    uint64_t streamed = inputs->has_dspark
+        ? inputs->dspark_streamed_bytes : 0;
+    if (!resident_tiers_fit(inputs->available_bytes, inputs->fixed_bytes,
+                            0, streamed, inputs->minimum_expert_bytes))
+        return plan_error(error, error_size,
+                          "resident V4 tiers leave too little target cache");
+
+    if (inputs->has_dspark &&
+        resident_tiers_fit(inputs->available_bytes, inputs->fixed_bytes,
+                           inputs->dense_bytes, inputs->dspark_full_bytes,
+                           inputs->minimum_expert_bytes)) {
+        plan->dense_resident = 1;
+        plan->dspark_resident = 1;
+        plan->dense_bytes = inputs->dense_bytes;
+        plan->dspark_bytes = inputs->dspark_full_bytes;
+    } else if (resident_tiers_fit(
+                   inputs->available_bytes, inputs->fixed_bytes,
+                   inputs->dense_bytes, streamed,
+                   inputs->minimum_expert_bytes)) {
+        plan->dense_resident = 1;
+        plan->dense_bytes = inputs->dense_bytes;
+        plan->dspark_bytes = streamed;
+    } else if (inputs->has_dspark &&
+               resident_tiers_fit(
+                   inputs->available_bytes, inputs->fixed_bytes, 0,
+                   inputs->dspark_full_bytes,
+                   inputs->minimum_expert_bytes)) {
+        plan->dspark_resident = 1;
+        plan->dspark_bytes = inputs->dspark_full_bytes;
+    } else {
+        plan->dspark_bytes = streamed;
+    }
+    return 0;
+}
 #endif /* COLI_V4_UNIT_RESOURCE_PLAN */
 
 #ifdef COLI_V4_UNIT_HEAD_CACHE
@@ -664,21 +727,20 @@ int coli_v4_expert_store_open_planned(
     }
 
     uint64_t fixed = plan.system_reserve_bytes + plan.runtime_reserve_bytes;
-    uint64_t full_required = fixed + head_bytes + dense_bytes +
-        dspark_full_bytes + plan.minimum_expert_bytes;
-    int full_resident = dspark_full_bytes &&
-        full_required <= plan.planner_available_bytes;
-    if (full_resident) {
-        dspark_bytes = dspark_full_bytes;
-        runtime->dense_resident = 1;
-        runtime->dspark_resident = 1;
-        runtime->dspark_expert_cache_bytes = dspark_full_experts;
-    } else {
-        dense_bytes = 0;
-        runtime->dense_resident = 0;
-        runtime->dspark_resident = 0;
-        runtime->dspark_expert_cache_bytes = 0;
-    }
+    int has_dspark = dspark_model && *dspark_model;
+    ColiDeepSeekV4ResidentTierPlan tiers;
+    ColiDeepSeekV4ResidentTierInputs tier_inputs = {
+        plan.planner_available_bytes, fixed, dense_bytes, dspark_bytes,
+        dspark_full_bytes, plan.minimum_expert_bytes, has_dspark,
+    };
+    if (coli_v4_resident_tier_plan(&tiers, &tier_inputs,
+                                   error, error_size)) return -1;
+    dense_bytes = tiers.dense_bytes;
+    dspark_bytes = tiers.dspark_bytes;
+    runtime->dense_resident = tiers.dense_resident;
+    runtime->dspark_resident = tiers.dspark_resident;
+    runtime->dspark_expert_cache_bytes = tiers.dspark_resident
+        ? dspark_full_experts : 0;
     if (dspark_bytes + dense_bytes > plan.planner_available_bytes - fixed) {
         snprintf(error, error_size, "resident V4 tiers exceed available RAM");
         return -1;
@@ -708,13 +770,14 @@ int coli_v4_expert_store_open_planned(
     if (resident_head && coli_v4_head_cache_load(
             engine, options->model_dir, error, error_size)) return -1;
     const char *dspark_tier = (dspark_model && *dspark_model)
-        ? (full_resident ? "resident" : "streamed") : "disabled";
+        ? (tiers.dspark_resident ? "resident" : "streamed") : "disabled";
     fprintf(stderr,
         "ram_tiers available=%.2fGiB dense=%s(%.2fGiB) "
         "dspark=%s(%.2fGiB) dspark_experts=%.2fGiB "
         "target_slots=%d target_cache=%.2fGiB head=%s projected=%.2fGiB\n",
         plan.planner_available_bytes / (double)GIB,
-        full_resident ? "resident" : "streamed", dense_bytes / (double)GIB,
+        tiers.dense_resident ? "resident" : "streamed",
+        dense_bytes / (double)GIB,
         dspark_tier, dspark_bytes / (double)GIB,
         dspark_full_experts / (double)GIB, slots,
         plan.expert_cache_bytes / (double)GIB,
@@ -1380,7 +1443,7 @@ static int attention_token_impl(float *output,
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
-    int scale_columns = (hidden + 127) / 128;
+    int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     for (int group = 0; !result && group < groups; group++) {
         ColiTensorView group_view = wo_a;
@@ -1776,7 +1839,7 @@ static int attention_token_impl(float *output,
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
-    int scale_columns = (hidden + 127) / 128;
+    int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     for (int group = 0; !result && group < groups; group++) {
         ColiTensorView group_view = wo_a;
@@ -2028,7 +2091,7 @@ int coli_v4_attention_window_batch_ref(
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
-    int scale_columns = (hidden + 127) / 128;
+    int scale_columns = (group_width + 127) / 128;
     int scale_rows = (o_rank + 127) / 128;
     float *group_inputs = malloc((size_t)batch * group_width * sizeof(*group_inputs));
     float *group_outputs = malloc((size_t)batch * o_rank * sizeof(*group_outputs));
@@ -4547,7 +4610,7 @@ static int attention_token_impl(float *output,
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
-    int scale_columns = (hidden + 127) / 128;
+    int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
     for (int group = 0; !result && group < groups; group++) {
         ColiTensorView group_view = wo_a;
@@ -8376,6 +8439,10 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     const int64_t heads = config->num_attention_heads;
     const int64_t head_dim = config->head_dim;
     const int64_t q_rank = config->q_lora_rank;
+    if (config->o_groups < 1 || heads % config->o_groups != 0)
+        return set_error(error, error_size, "unsupported grouped-output attention dimensions");
+    const int64_t o_group_width =
+        (heads / config->o_groups) * head_dim;
     const int64_t o_width = (int64_t)config->o_groups * config->o_lora_rank;
     const int64_t experts = config->n_routed_experts;
     const int64_t moe = config->moe_intermediate_size;
@@ -8386,7 +8453,7 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     ADD(add_1d(plan, COLI_ST_BF16, head_dim, "attn.kv_norm.weight", error, error_size));
     ADD(add_1d(plan, COLI_ST_BF16, q_rank, "attn.q_norm.weight", error, error_size));
     ADD(add_fp8(plan, head_dim, hidden, "attn.wkv", error, error_size));
-    ADD(add_fp8(plan, o_width, hidden, "attn.wo_a", error, error_size));
+    ADD(add_fp8(plan, o_width, o_group_width, "attn.wo_a", error, error_size));
     ADD(add_fp8(plan, hidden, o_width, "attn.wo_b", error, error_size));
     ADD(add_fp8(plan, q_rank, hidden, "attn.wq_a", error, error_size));
     ADD(add_fp8(plan, heads * head_dim, q_rank, "attn.wq_b", error, error_size));

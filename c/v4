@@ -18,6 +18,12 @@ BOS = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
 USER = "<\uff5cUser\uff5c>"
 ASSISTANT = "<\uff5cAssistant\uff5c>"
 EOS = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+DSPARK_CONFIG_FIELDS = (
+    "dspark_block_size",
+    "dspark_noise_token_id",
+    "dspark_markov_rank",
+    "dspark_target_layer_ids",
+)
 
 
 def configure_stdio_utf8():
@@ -78,6 +84,11 @@ def validate_model(model):
     )
     if not is_v4:
         raise SystemExit(f"model is not a DeepSeek V4 checkpoint: {model}")
+    return config
+
+
+def has_dspark_manifest(config):
+    return all(field in config for field in DSPARK_CONFIG_FIELDS)
 
 
 def validate_engine():
@@ -113,6 +124,13 @@ def engine_command(args, prompt=None, raw=True, prompt_file=None):
         command.append("--raw-prompt")
     if args.ram:
         command.extend(("--memory-gb", f"{args.ram:g}"))
+    draft_model = getattr(args, "draft_model", None)
+    if draft_model:
+        command.extend(("--draft-model", os.path.abspath(draft_model)))
+    elif not getattr(args, "model_has_dspark", False):
+        # Target-only checkpoints (including V4 Pro) do not carry the
+        # dspark_* manifest required by the native speculative runner.
+        command.append("--no-dspark")
     if getattr(args, "stop_sentence", False):
         command.append("--stop-sentence")
     return command
@@ -181,7 +199,14 @@ def emit_bytes(chunk):
 
 
 def generate(args, prompt, raw=True, stream=True):
-    validate_model(args.model)
+    target_config = validate_model(args.model)
+    args.model_has_dspark = has_dspark_manifest(target_config)
+    if getattr(args, "draft_model", None):
+        draft_config = validate_model(args.draft_model)
+        if not has_dspark_manifest(draft_config):
+            raise SystemExit(
+                f"DSpark config fields are missing from {args.draft_model}"
+            )
     validate_engine()
     # Always pass the prompt through a UTF-8 file. Windows argv uses the ANSI
     # code page for MinGW main(), which corrupts Chinese from PowerShell.
@@ -263,6 +288,8 @@ def cmd_chat(args):
 
 def add_runtime_arguments(parser):
     parser.add_argument("--model", required=True, help="DeepSeek V4 model directory")
+    parser.add_argument("--draft-model", metavar="PATH",
+                        help="separate DSpark checkpoint; disabled when no manifest is present")
     parser.add_argument("--ram", type=positive_float, default=0, metavar="GIB",
                         help="process RAM limit in GiB (default: auto)")
     parser.add_argument("--ngen", type=positive_int, default=128, metavar="N",

@@ -507,10 +507,31 @@ typedef struct {
     int slots_per_layer;
 } ColiDeepSeekV4ResourcePlan;
 
+typedef struct {
+    uint64_t available_bytes;
+    uint64_t fixed_bytes;
+    uint64_t dense_bytes;
+    uint64_t dspark_streamed_bytes;
+    uint64_t dspark_full_bytes;
+    uint64_t minimum_expert_bytes;
+    int has_dspark;
+} ColiDeepSeekV4ResidentTierInputs;
+
+typedef struct {
+    uint64_t dense_bytes;
+    uint64_t dspark_bytes;
+    int dense_resident;
+    int dspark_resident;
+} ColiDeepSeekV4ResidentTierPlan;
+
 uint64_t coli_v4_os_available_memory(void);
 int coli_v4_resource_plan_compute(
     ColiDeepSeekV4ResourcePlan *plan,
     const ColiDeepSeekV4ResourceInputs *inputs,
+    char *error, size_t error_size);
+int coli_v4_resident_tier_plan(
+    ColiDeepSeekV4ResidentTierPlan *plan,
+    const ColiDeepSeekV4ResidentTierInputs *inputs,
     char *error, size_t error_size);
 /* ==== end deepseek_v4_resource_plan.h ==== */
 

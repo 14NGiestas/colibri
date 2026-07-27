@@ -81,11 +81,36 @@ class V4CliTest(unittest.TestCase):
 
     def test_engine_command_prefers_prompt_file(self):
         cli = load_cli()
-        args = argparse.Namespace(model=str(HERE), ngen=32, ram=0, stop_sentence=False)
+        args = argparse.Namespace(
+            model=str(HERE), draft_model=None, ngen=32, ram=0,
+            stop_sentence=False,
+        )
         command = cli.engine_command(args, raw=True, prompt_file=r"C:\tmp\prompt.txt")
         self.assertIn("--prompt-file", command)
+        self.assertIn("--no-dspark", command)
         self.assertIn(r"C:\tmp\prompt.txt", command)
         self.assertNotIn("你好", command)
+
+    def test_engine_command_enables_explicit_dspark_model(self):
+        cli = load_cli()
+        args = argparse.Namespace(
+            model=str(HERE), draft_model=str(HERE / "draft"), ngen=1,
+            ram=0, stop_sentence=False,
+        )
+        command = cli.engine_command(args, prompt="hello")
+        self.assertIn("--draft-model", command)
+        self.assertIn(str((HERE / "draft").resolve()), command)
+        self.assertNotIn("--no-dspark", command)
+
+    def test_engine_command_keeps_combined_dspark_default(self):
+        cli = load_cli()
+        args = argparse.Namespace(
+            model=str(HERE), draft_model=None, model_has_dspark=True,
+            ngen=1, ram=0, stop_sentence=False,
+        )
+        command = cli.engine_command(args, prompt="hello")
+        self.assertNotIn("--no-dspark", command)
+        self.assertNotIn("--draft-model", command)
 
     def test_write_prompt_file_is_utf8(self):
         cli = load_cli()
