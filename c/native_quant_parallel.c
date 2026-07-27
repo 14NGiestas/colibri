@@ -73,6 +73,23 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
     free(activation_scales); free(activation); return 0;
 }
 
+#ifdef __AVX512F__
+#include <immintrin.h>
+
+static inline __m512 fp8_decode_16(const uint8_t *src) {
+    __m512i v = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)src));
+    __m512i mag = _mm512_and_si512(v, _mm512_set1_epi32(0x7f));
+    __m512i sign = _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0x80)), 24);
+    __m512 normal = _mm512_castsi512_ps(_mm512_add_epi32(
+        _mm512_slli_epi32(mag, 20), _mm512_set1_epi32(120 << 23)));
+    __m512 denormal = _mm512_mul_ps(_mm512_cvtepi32_ps(mag), _mm512_set1_ps(1.0f/512.0f));
+    __mmask16 dm = _mm512_cmpeq_epi32_mask(
+        _mm512_srli_epi32(mag, 3), _mm512_setzero_si512());
+    __m512 magnitude = _mm512_mask_blend_ps(dm, normal, denormal);
+    return _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(magnitude), sign));
+}
+#endif
+
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||
@@ -94,33 +111,47 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                                     input, columns, 128) != 0) {
         free(activation_scales); free(activation); return -1;
     }
-    float fp4_unused[16], fp8[256], e8[256];
-    build_decode_tables_v4(fp4_unused, fp8, e8);
+    float e8[256];
+    for (int i = 0; i < 256; i++) e8[i] = coli_e8m0_decode((uint8_t)i);
     const uint8_t *data = weight->data, *scales = weight->scales;
     int64_t tiles = (weight->rows + ROW_TILE - 1) / ROW_TILE;
     #pragma omp parallel for schedule(static)
     for (int64_t tile = 0; tile < tiles; tile++) {
         int count = (int)(weight->rows - tile * ROW_TILE);
         if (count > ROW_TILE) count = ROW_TILE;
-        size_t row_data[ROW_TILE], scale_row[ROW_TILE];
+        size_t rd[ROW_TILE], sr[ROW_TILE];
         float sums[ROW_TILE] = {0};
         for (int lane = 0; lane < count; lane++) {
             size_t row = (size_t)tile * ROW_TILE + (size_t)lane;
-            row_data[lane] = row * columns;
-            scale_row[lane] = row / 128;
+            rd[lane] = row * columns;
+            sr[lane] = row / 128;
         }
         for (size_t base = 0; base < columns; base += 128) {
-            float block_scales[ROW_TILE];
+            float bs[ROW_TILE];
             for (int lane = 0; lane < count; lane++)
-                block_scales[lane] = e8[scales[scale_row[lane] *
-                                                scale_columns + base / 128]];
+                bs[lane] = e8[scales[sr[lane] * scale_columns + base / 128]];
+#ifdef __AVX512F__
+            __m512 acc[ROW_TILE];
+            for (int lane = 0; lane < count; lane++)
+                acc[lane] = _mm512_setzero_ps();
+            for (size_t offset = 0; offset < 128; offset += 16) {
+                __m512 a = _mm512_loadu_ps(activation + base + offset);
+                for (int lane = 0; lane < count; lane++) {
+                    __m512 w = fp8_decode_16(data + rd[lane] + base + offset);
+                    __m512 ws = _mm512_mul_ps(w, _mm512_set1_ps(bs[lane]));
+                    acc[lane] = _mm512_fmadd_ps(a, ws, acc[lane]);
+                }
+            }
+            for (int lane = 0; lane < count; lane++)
+                sums[lane] += _mm512_reduce_add_ps(acc[lane]);
+#else
             for (size_t offset = 0; offset < 128; offset++) {
                 size_t column = base + offset;
                 float x = activation[column];
                 for (int lane = 0; lane < count; lane++)
-                    sums[lane] += x * fp8[data[row_data[lane] + column]] *
-                                  block_scales[lane];
+                    sums[lane] += x * coli_e4m3fn_decode(data[rd[lane] + column]) * bs[lane];
             }
+#endif
         }
         for (int lane = 0; lane < count; lane++)
             output[(size_t)tile * ROW_TILE + (size_t)lane] = sums[lane];

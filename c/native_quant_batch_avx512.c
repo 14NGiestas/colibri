@@ -120,11 +120,9 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
             free(activation_scales); free(activations); return -1;
         }
 
-    float fp8[256], e8[256];
-    for (int i = 0; i < 256; i++) {
-        fp8[i] = coli_e4m3fn_decode((uint8_t)i);
+    float e8[256];
+    for (int i = 0; i < 256; i++)
         e8[i] = coli_e8m0_decode((uint8_t)i);
-    }
     const uint8_t *data = weight->data, *scales = weight->scales;
     #pragma omp parallel for schedule(static)
     for (int64_t row = 0; row < weight->rows; row++) {
@@ -132,22 +130,28 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
         size_t row_data = (size_t)row * columns;
         size_t scale_row = (size_t)row / 128;
         for (size_t base = 0; base < columns; base += 128) {
-            __m512 scale = _mm512_set1_ps(
-                e8[scales[scale_row * scale_columns + base / 128]]);
+            float s = e8[scales[scale_row * scale_columns + base / 128]];
             for (size_t chunk = 0; chunk < 128; chunk += 16) {
                 __m128i packed_codes = _mm_loadu_si128(
                     (const __m128i *)(data + row_data + base + chunk));
                 __m512i codes = _mm512_cvtepu8_epi32(packed_codes);
-                __m512 values = _mm512_i32gather_ps(codes, fp8, 4);
+                __m512i mag = _mm512_and_si512(codes, _mm512_set1_epi32(0x7f));
+                __m512i sign = _mm512_slli_epi32(
+                    _mm512_and_si512(codes, _mm512_set1_epi32(0x80)), 24);
+                __m512 normal = _mm512_castsi512_ps(_mm512_add_epi32(
+                    _mm512_slli_epi32(mag, 20), _mm512_set1_epi32(120 << 23)));
+                __m512 denormal = _mm512_mul_ps(_mm512_cvtepi32_ps(mag),
+                    _mm512_set1_ps(1.0f/512.0f));
+                __mmask16 dm = _mm512_cmpeq_epi32_mask(
+                    _mm512_srli_epi32(mag, 3), _mm512_setzero_si512());
+                __m512 magnitude = _mm512_mask_blend_ps(dm, normal, denormal);
+                __m512 w = _mm512_castsi512_ps(
+                    _mm512_or_si512(_mm512_castps_si512(magnitude), sign));
+                w = _mm512_mul_ps(w, _mm512_set1_ps(s));
                 for (int item = 0; item < batch; item++) {
-                    __m512 activation = _mm512_loadu_ps(
+                    __m512 a = _mm512_loadu_ps(
                         activations + (size_t)item * columns + base + chunk);
-                    __m512 product = _mm512_mul_ps(
-                        _mm512_mul_ps(activation, values), scale);
-                    float products[16];
-                    _mm512_storeu_ps(products, product);
-                    for (int lane = 0; lane < 16; lane++)
-                        sums[item] += products[lane];
+                    sums[item] += _mm512_reduce_add_ps(_mm512_mul_ps(a, w));
                 }
             }
         }
